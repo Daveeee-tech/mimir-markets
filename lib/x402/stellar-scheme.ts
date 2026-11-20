@@ -2,6 +2,7 @@
  * Mimir's Stellar-native x402 payment scheme — `exact` on `stellar:testnet`.
  *
  * This module is the whole mechanism: the buyer half, the seller half, and the
+ * ... 
  * local stand-in for what used to be an HTTP facilitator. It implements the real
  * `@x402/core` v2.21 interfaces (`SchemeNetworkClient`, `SchemeNetworkServer`,
  * `SchemeNetworkFacilitator`, `FacilitatorClient`) — nothing here is a shim
@@ -218,6 +219,8 @@ export type StellarVerifyFailure =
   | "already_settled"
   | "horizon_unavailable";
 
+export const RETRYABLE_VERIFY_FAILURES: ReadonlySet<StellarVerifyFailure> = new Set(["horizon_unavailable"]);
+
 export type StellarVerifyResult =
   | {
       ok: true;
@@ -424,6 +427,8 @@ export async function verifyStellarPayment(
 
   return { ok: true, transaction: proof.transaction, payer: proof.payer, amountAtomic: paid, settledAt: createdAt };
 }
+
+// ── Decision trace (privacy-safe) ─────────────────────────────────────────────
 
 /** Ed25519 check. Fails closed on anything malformed, like `lib/stellar-message.ts`. */
 function verifyProofSignature(proof: StellarPaymentProof, message: string): boolean {
@@ -644,7 +649,12 @@ export class ExactStellarFacilitator implements SchemeNetworkFacilitator {
       backend: this.backend,
     });
     if (!result.ok) {
-      return { isValid: false, invalidReason: result.reason, invalidMessage: result.message };
+      return {
+        isValid: false,
+        invalidReason: result.reason,
+        invalidMessage: result.message,
+        extra: { retryable: RETRYABLE_VERIFY_FAILURES.has(result.reason) },
+      };
     }
     if (await isSettlementConsumed(requirements.network, result.transaction)) {
       return {
