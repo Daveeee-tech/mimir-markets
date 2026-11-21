@@ -32,11 +32,17 @@
  *  7. **Dependency failure.** When `vsId` is invalid (NaN, ≤ 0) the hook
  *     moves into `dependency_failure` rather than firing empty requests.
  *
+ *  8. **Ledger-observed expiry.** The returned `expiry` evaluates the deadline
+ *     against the latest observation (with the server clock reconstructed from
+ *     the freshness metadata) instead of the browser clock alone. It reports
+ *     `estimateStale` when the observation aged out, the index is stale or the
+ *     clocks disagree, and only sets `challengeable` for a fresh open window.
+ *
  * The hook is purely logic.  No JSX, no toast side-effects — all of that stays
  * in the page component so the boundary between state and rendering is clear.
  */
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { getVSFull } from "@/lib/contract";
 import { getPendingVS } from "@/lib/pending-vs";
@@ -52,6 +58,12 @@ import {
   VS_DETAIL_MAX_ATTEMPTS,
 } from "@/lib/vs-detail-state";
 import { getNextPollDelay } from "@/lib/poll-schedule";
+import {
+  evaluateMarketExpiry,
+  observationFromFreshness,
+  type ExpiryObservation,
+  type MarketExpiry,
+} from "@/lib/market-expiry";
 import type { VSData } from "@/lib/contract";
 import type { VSCacheFreshness } from "@/lib/vs-freshness";
 
@@ -143,6 +155,13 @@ export interface UseVsDetailResult {
   activityLoading: boolean;
   /** Error message from the last activity fetch, or null. */
   activityError: string | null;
+  /**
+   * Deadline estimate evaluated against the latest observed ledger context.
+   * `estimateStale` is true when the observation aged out, the read index is
+   * stale or the browser clock disagrees with the server clock, and
+   * `challengeable` is only true for a fresh, open observation.
+   */
+  expiry: MarketExpiry;
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
@@ -167,6 +186,14 @@ export function useVsDetail({
   const [cache, setCache] = useState<VSCacheFreshness | null>(null);
   const [fetchAttempts, setFetchAttempts] = useState(0);
   const [refreshing, setRefreshing] = useState(false);
+
+  // ── Observed ledger context ───────────────────────────────────────────────
+  //
+  // Expiry is a ledger timestamp. We can only observe it through a read, so the
+  // hook records when the snapshot arrived and evaluates the deadline against
+  // that observation instead of trusting the browser clock on its own.
+  const [expiryObservation, setExpiryObservation] = useState<ExpiryObservation | null>(null);
+  const [expiryClockMs, setExpiryClockMs] = useState<number>(() => Date.now());
 
   /**
    * Consecutive failure count used to back off the polling interval.
@@ -226,6 +253,8 @@ export function useVsDetail({
       setFetchAttempts(0);
       consecutiveFailuresRef.current = 0;
       setRefreshing(false);
+      setExpiryObservation(null);
+      setExpiryClockMs(Date.now());
       setPhase(isValidVsId(vsId) ? "loading" : "invalid");
       setActivity([]);
       setActivityLoading(false);
@@ -259,6 +288,12 @@ export function useVsDetail({
         }
         setVs(data);
         setCache(null);
+        setExpiryObservation({
+          source: "sample",
+          receivedAtMs: Date.now(),
+          serverNowMs: null,
+          freshness: null,
+        });
         setPhase("ready");
         return;
       }
@@ -291,6 +326,9 @@ export function useVsDetail({
             return snapshot.item!;
           });
           setCache(snapshot.cache ?? null);
+          setExpiryObservation(
+            observationFromFreshness(snapshot.cache ?? null, Date.now())
+          );
           setFetchAttempts(0);
           consecutiveFailuresRef.current = 0;
           setPhase("ready");
@@ -304,6 +342,14 @@ export function useVsDetail({
           if (myGeneration !== generationRef.current) return;
           setVs(pending);
           setCache(null);
+          // Optimistic local state is not a ledger observation: the deadline is
+          // shown as an estimate until the first on-chain read lands.
+          setExpiryObservation({
+            source: "local_draft",
+            receivedAtMs: Date.now(),
+            serverNowMs: null,
+            freshness: null,
+          });
           consecutiveFailuresRef.current = 0;
           setPhase("ready");
           setRefreshing(false);
@@ -514,6 +560,29 @@ export function useVsDetail({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [fetchVs, fetchActivity, inviteKey, isSampleVS, vsId]);
 
+  // ── Expiry estimate ───────────────────────────────────────────────────────
+
+  // Keep the observation age (and the countdown used by consumers) moving even
+  // while no poll lands, so a backgrounded tab cannot keep an old estimate
+  // looking fresh.
+  useEffect(() => {
+    if (phase !== "ready" || !vs) return;
+    setExpiryClockMs(Date.now());
+    const interval = setInterval(() => setExpiryClockMs(Date.now()), 1000);
+    return () => clearInterval(interval);
+  }, [phase, vs]);
+
+  const expiry = useMemo(
+    () =>
+      evaluateMarketExpiry({
+        deadlineUnix: vs?.deadline ?? null,
+        nowMs: expiryClockMs,
+        observation: expiryObservation,
+        marketState: vs?.state ?? null,
+      }),
+    [vs?.deadline, vs?.state, expiryClockMs, expiryObservation]
+  );
+
   // ── Return ────────────────────────────────────────────────────────────────
 
   return {
@@ -529,5 +598,6 @@ export function useVsDetail({
     activity,
     activityLoading,
     activityError,
+    expiry,
   };
 }
